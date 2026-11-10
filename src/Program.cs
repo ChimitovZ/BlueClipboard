@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -62,7 +63,22 @@ namespace BlueClipboard
                                 var render = new System.Windows.Media.Imaging.RenderTargetBitmap((int)app.MainWindow.ActualWidth, (int)app.MainWindow.ActualHeight, 96, 96, PixelFormats.Pbgra32);
                                 render.Render(app.MainWindow);
                                 File.WriteAllBytes(Path.Combine(folder, "preview.png"), Images.Encode(render));
-                                File.WriteAllText(Path.Combine(folder, "smoke.txt"), ok ? "PASS: startup, asynchronous history load, selection and preview." : "FAIL: history/preview missing.");
+                                var window = app.MainWindow;
+                                var resize = (Button)window.FindName("RestoreButton");
+                                var bounds = window.RestoreBounds;
+                                resize.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                                bool maximized = window.WindowState == WindowState.Maximized;
+                                window.Hide();
+                                Native.PostMessage(new WindowInteropHelper(window).Handle, Native.OpenMessage, IntPtr.Zero, IntPtr.Zero);
+                                await Dispatcher.Yield(DispatcherPriority.ApplicationIdle);
+                                maximized &= window.IsVisible && window.WindowState == WindowState.Maximized;
+                                resize.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                                bool restored = window.WindowState == WindowState.Normal && window.RestoreBounds == bounds;
+                                bool pixelScroll = VirtualizingPanel.GetScrollUnit(list) == ScrollUnit.Pixel && VirtualizingPanel.GetIsVirtualizing(list);
+                                File.WriteAllText(Path.Combine(folder, "smoke.txt"),
+                                    ok && maximized && restored && pixelScroll
+                                    ? "PASS: startup, history, preview, virtualized pixel scrolling, maximize, reopen and restore."
+                                    : String.Format("FAIL: history/preview={0}, maximize/reopen={1}, restore={2}, pixel scrolling={3}.", ok, maximized, restored, pixelScroll));
                                 await controller.Quit();
                             };
                             timer.Start();
@@ -87,6 +103,9 @@ namespace BlueClipboard
         private readonly ClipboardService clipboard;
         private HwndSource source;
         private IntPtr handle, target;
+        private IntPtr winVHook;
+        private readonly Native.KeyboardHook winVCallback;
+        private bool winVPressed;
         private Forms.NotifyIcon tray;
         private System.Drawing.Icon trayIcon;
         private readonly DispatcherTimer updateTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(30) };
@@ -100,6 +119,7 @@ namespace BlueClipboard
         public Controller(Application app, Store store, string folder, bool demo)
         {
             this.app = app; this.store = store; this.folder = folder; this.demo = demo;
+            winVCallback = HandleWinV;
             using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("MainWindow.xaml")) window = (Window)XamlReader.Load(stream);
             if (demo) window.Title = "BlueClipboard · Демо";
             app.MainWindow = window;
@@ -112,7 +132,15 @@ namespace BlueClipboard
             statusTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(7) };
             statusTimer.Tick += delegate { statusTimer.Stop(); DefaultStatus(); };
             Wire();
-            Ui<Button>("RestoreButton").Click += delegate { RestoreSize(); };
+            Ui<Button>("RestoreButton").Click += delegate { ToggleMaximized(); };
+            window.StateChanged += delegate
+            {
+                bool maximized = window.WindowState == WindowState.Maximized;
+                var button = Ui<Button>("RestoreButton");
+                button.Content = maximized ? "\uE923" : "\uE922";
+                button.ToolTip = maximized ? "Восстановить размер" : "Развернуть";
+                System.Windows.Automation.AutomationProperties.SetName(button, (string)button.ToolTip);
+            };
             Ui<Button>("UpdateButton").Click += async delegate { await CheckUpdates(false); };
             Ui<TextBlock>("VersionLabel").Text = "Версия " + AppInfo.VersionText;
         }
@@ -121,7 +149,6 @@ namespace BlueClipboard
             DefaultStatus();
             handle = new WindowInteropHelper(window).EnsureHandle();
             source = HwndSource.FromHwnd(handle); source.AddHook(Messages);
-            window.StateChanged += delegate { if (window.WindowState == WindowState.Maximized) RestoreSize(); };
             if (!demo)
             {
                 captureEnabled = Native.AddClipboardFormatListener(handle);
@@ -129,6 +156,8 @@ namespace BlueClipboard
                 if (!captureEnabled) Notice("Не удалось подключить наблюдение за буфером. Перезапустите приложение.");
                 if (!Native.RegisterHotKey(handle, 1, 0x4006, 0x56)) Notice("Ctrl+Shift+V занято другой программой. Панель доступна из трея.");
                 CreateTray(); clipboard.OnUpdate();
+                if (store.GetSetting("winV", "false") == "true" && !SetWinV(true))
+                    Notice("Не удалось включить Win+V. Панель доступна через Ctrl+Shift+V и из трея.");
                 if (AppInfo.IsInstalled) { updateTimer.Tick += async delegate { updateTimer.Interval = TimeSpan.FromHours(12); if (!window.IsVisible && store.GetSetting("autoUpdate", "true") == "true") await CheckUpdates(true); }; updateTimer.Start(); }
             }
             if (!background) ShowPanel(IntPtr.Zero);
@@ -169,7 +198,9 @@ namespace BlueClipboard
             };
             Ui<Border>("TitleBar").MouseLeftButtonDown += delegate(object sender, MouseButtonEventArgs e)
             {
-                if (e.OriginalSource is TextBlock || e.OriginalSource is Border) { if (e.ButtonState == MouseButtonState.Pressed) window.DragMove(); }
+                if (!(e.OriginalSource is TextBlock || e.OriginalSource is Border)) return;
+                if (e.ClickCount == 2) ToggleMaximized();
+                else if (e.ButtonState == MouseButtonState.Pressed && window.WindowState == WindowState.Normal) window.DragMove();
             };
             window.Closing += delegate(object sender, System.ComponentModel.CancelEventArgs e) { if (!exiting) { e.Cancel = true; window.Hide(); } };
             window.Deactivated += delegate { if (!modal && !busy && !demo && Ui<Border>("SettingsPanel").Visibility != Visibility.Visible) window.Hide(); };
@@ -193,7 +224,6 @@ namespace BlueClipboard
         private IntPtr Messages(IntPtr hwnd, int msg, IntPtr w, IntPtr l, ref bool handled)
         {
             if (msg == 0x8002 && !demo) { window.Dispatcher.BeginInvoke(new Action(async delegate { await Quit(); })); handled = true; }
-            else if (msg == 0x0112 && (w.ToInt64() & 0xFFF0) == 0xF030) handled = true;
             else if (msg == 0x031D) { clipboard.OnUpdate(); handled = true; }
             else if (msg == 0x0312 || msg == Native.OpenMessage)
             {
@@ -211,20 +241,52 @@ namespace BlueClipboard
             Ui<Border>("SettingsPanel").Visibility = Visibility.Collapsed;
             Ui<TextBox>("SearchBox").Text = "";
             Ui<RadioButton>("AllFilter").IsChecked = true; filter = "all";
-            RestoreSize();
-            window.Show(); window.Activate(); Native.SetForegroundWindow(handle);
+            window.Show();
+            if (window.WindowState == WindowState.Minimized) Native.ShowWindow(handle, 9); // SW_RESTORE
+            window.Activate(); Native.SetForegroundWindow(handle);
             Ui<TextBox>("SearchBox").Focus(); Refresh(true); UpdateActions();
         }
-        private void RestoreSize()
+        private void ToggleMaximized()
         {
-            window.WindowState = WindowState.Normal;
-            // Position in the working area of the monitor under the pointer, in WPF units.
-            var screen = Forms.Screen.FromPoint(Forms.Cursor.Position);
-            var transform = source.CompositionTarget.TransformFromDevice;
-            Point topLeft = transform.Transform(new Point(screen.WorkingArea.Left, screen.WorkingArea.Top));
-            Point bottomRight = transform.Transform(new Point(screen.WorkingArea.Right, screen.WorkingArea.Bottom));
-            window.Width = Math.Min(800, bottomRight.X - topLeft.X - 24); window.Height = Math.Min(660, bottomRight.Y - topLeft.Y - 24);
-            window.Left = bottomRight.X - window.Width - 12; window.Top = bottomRight.Y - window.Height - 12;
+            window.WindowState = window.WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized;
+        }
+        private bool SetWinV(bool enabled)
+        {
+            if (enabled && winVHook == IntPtr.Zero)
+                winVHook = Native.SetWindowsHookEx(13, winVCallback, Native.GetModuleHandle(null), 0); // WH_KEYBOARD_LL
+            else if (!enabled && winVHook != IntPtr.Zero && Native.UnhookWindowsHookEx(winVHook))
+            {
+                winVHook = IntPtr.Zero;
+                winVPressed = false;
+            }
+            bool active = winVHook != IntPtr.Zero;
+            Ui<TextBlock>("HotkeyLabel").Text = active ? "Win + V" : "Ctrl + Shift + V";
+            if (tray != null) tray.Text = active ? "BlueClipboard · Win+V / Ctrl+Shift+V" : "BlueClipboard · Ctrl+Shift+V";
+            return active == enabled;
+        }
+        private IntPtr HandleWinV(int code, IntPtr message, IntPtr data)
+        {
+            if (code == 0 && Marshal.ReadInt32(data) == 0x56) // KBDLLHOOKSTRUCT.vkCode
+            {
+                bool down = message.ToInt64() == 0x0100 || message.ToInt64() == 0x0104;
+                if (winVPressed)
+                {
+                    winVPressed = down;
+                    return new IntPtr(1);
+                }
+                if (down && (Native.Down(0x5B) || Native.Down(0x5C)) &&
+                    !Native.Down(0x10) && !Native.Down(0x11) && !Native.Down(0x12) && !Native.Down(0x56))
+                {
+                    if (Native.PostMessage(handle, Native.OpenMessage, Native.GetForegroundWindow(), IntPtr.Zero))
+                    {
+                        winVPressed = true;
+                        // Mark Win as part of a chord so releasing it does not open Start.
+                        Native.SendInput(2, new[] { Native.Key(0xFF, false), Native.Key(0xFF, true) }, Marshal.SizeOf(typeof(Native.Input)));
+                        return new IntPtr(1);
+                    }
+                }
+            }
+            return Native.CallNextHookEx(winVHook, code, message, data);
         }
         private async void Refresh(bool reset, bool more = false)
         {
@@ -332,12 +394,15 @@ namespace BlueClipboard
             Ui<CheckBox>("AutoUpdate").IsEnabled = AppInfo.IsInstalled && !demo;
             using (var key = Registry.CurrentUser.OpenSubKey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")) Ui<CheckBox>("StartupSetting").IsChecked = key != null && key.GetValue("BlueClipboard") != null;
             Ui<CheckBox>("StartupSetting").IsEnabled = !demo;
+            Ui<CheckBox>("WinVSetting").IsChecked = winVHook != IntPtr.Zero;
+            Ui<CheckBox>("WinVSetting").IsEnabled = !demo;
             SelectTag(Ui<ComboBox>("LimitSetting"), clipboard.MaxItems.ToString()); SelectTag(Ui<ComboBox>("SizeSetting"), (clipboard.MaxBytes / 1048576).ToString());
             Ui<Border>("SettingsPanel").Visibility = Visibility.Visible;
         }
         private static void SelectTag(ComboBox box, string tag) { foreach (ComboBoxItem item in box.Items) if ((string)item.Tag == tag) { box.SelectedItem = item; return; } }
         private async Task SaveSettings()
         {
+            bool winV = Ui<CheckBox>("WinVSetting").IsChecked == true;
             int maxItems = Int32.Parse((string)((ComboBoxItem)Ui<ComboBox>("LimitSetting").SelectedItem).Tag);
             long maxMB = Int64.Parse((string)((ComboBoxItem)Ui<ComboBox>("SizeSetting").SelectedItem).Tag);
             if (((maxItems > 0 && (clipboard.MaxItems == 0 || maxItems < clipboard.MaxItems)) || (maxMB > 0 && (clipboard.MaxBytes == 0 || maxMB * 1048576 < clipboard.MaxBytes))) && !Confirm("Уменьшить лимит? Самые старые незакреплённые записи сверх нового лимита будут удалены.")) return;
@@ -356,6 +421,15 @@ namespace BlueClipboard
                 clipboard.MaxItems = maxItems; clipboard.MaxBytes = maxMB * 1048576;
                 await clipboard.Pending;
                 await Task.Run(delegate { store.Trim(maxItems, maxMB * 1048576); });
+                if (!demo)
+                {
+                    if (!SetWinV(winV))
+                    {
+                        Notice(winV ? "Не удалось включить Win+V." : "Не удалось отключить Win+V.");
+                        return;
+                    }
+                    store.Set("winV", winV ? "true" : "false");
+                }
                 Ui<Border>("SettingsPanel").Visibility = Visibility.Collapsed; Refresh(false); Notice("Настройки сохранены.");
             }
             catch (Exception ex) { Notice("Не удалось сохранить настройки: " + ex.Message); }
@@ -423,6 +497,7 @@ namespace BlueClipboard
         {
             if (exiting) return; exiting = true;
             clipboard.Stop(); Native.RemoveClipboardFormatListener(handle); Native.UnregisterHotKey(handle, 1);
+            if (winVHook != IntPtr.Zero) SetWinV(false);
             if (tray != null) { tray.Visible = false; tray.Dispose(); trayIcon.Dispose(); }
             searchTimer.Stop(); statusTimer.Stop(); updateTimer.Stop();
             await clipboard.Pending;
